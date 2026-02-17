@@ -1,0 +1,1719 @@
+---
+title: "Hepker, Sprout - Final Project"
+output: html_document
+date: "05/04/2025"
+---
+
+```{r assignment_setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = FALSE)
+setwd("C:/projects/eco664/final_project")
+
+library(knitr)
+library(forecast)
+library(hts)
+library(tidyverse)
+library(scales)
+library(zoo)
+library(data.table)
+library(fasttime)
+
+```
+
+
+```{r process_raw_data, message=FALSE}
+
+options(stringsAsFactors = FALSE)
+
+# ---- load game metadata ----
+info_df <- fread("applicationInformation.csv")
+genres_df <- fread("applicationGenres.csv")
+
+# merge name and genre by appID
+merged_df <- merge(info_df[, .(appID, name)], genres_df, by = "appID", all.x = TRUE)
+
+# define game list
+selected_games <- c(
+  # indie
+  "RimWorld",
+  "Stardew Valley",
+
+  # rpg
+  "Pillars of Eternity",
+  "The Elder Scrolls V: Skyrim Special Edition",
+
+  # massively multiplayer
+  "FINAL FANTASY XIV Online",
+  "The Elder Scrolls Online: Tamriel Unlimited"
+)
+
+# filter metadata for selected games
+selected_metadata <- merged_df[name %in% selected_games]
+selected_appIDs <- unique(selected_metadata$appID)
+
+
+# ---- process player count data from pt1 and pt2 ----
+
+# read and process pt1 data
+pt1_files <- list.files("PlayerCountHistoryPt1", pattern = "\\.csv$", full.names = TRUE)
+pt1_list <- list()
+for (file in pt1_files) {
+  appid <- as.integer(gsub("\\.csv$", "", basename(file)))
+  if (!(appid %in% selected_appIDs)) next
+  df <- tryCatch(fread(file, select = c("Time", "Playercount")), error = function(e) NULL)
+  if (is.null(df) || nrow(df) == 0) next
+  df$datetime <- fastPOSIXct(df$Time)
+  df$date <- as.Date(df$datetime)
+  df$appID <- appid
+  daily <- df[, .(
+    mean_playercount = mean(Playercount, na.rm = TRUE)
+  ), by = .(appID, date)]
+  pt1_list[[length(pt1_list) + 1]] <- daily
+}
+player_pt1 <- rbindlist(pt1_list)
+
+# read and process pt2 data
+pt2_files <- list.files("PlayerCountHistoryPt2", pattern = "\\.csv$", full.names = TRUE)
+pt2_list <- list()
+for (file in pt2_files) {
+  appid <- as.integer(gsub("\\.csv$", "", basename(file)))
+  if (!(appid %in% selected_appIDs)) next
+  df <- tryCatch(fread(file, select = c("Time", "Playercount")), error = function(e) NULL)
+  if (is.null(df) || nrow(df) == 0) next
+  df$datetime <- fastPOSIXct(df$Time)
+  df$date <- as.Date(df$datetime)
+  df$appID <- appid
+  daily <- df[, .(
+    mean_playercount = mean(Playercount, na.rm = TRUE)
+  ), by = .(appID, date)]
+  pt2_list[[length(pt2_list) + 1]] <- daily
+}
+player_pt2 <- rbindlist(pt2_list)
+
+# combine player data and merge with game metadata
+player_data <- rbind(player_pt1, player_pt2)
+player_data <- merge(player_data, selected_metadata, by = "appID", all.x = TRUE)
+
+# filter to 15-month period
+cutoff_date <- as.Date("2019-05-12")
+player_data <- player_data[date >= cutoff_date]
+
+# keep only relevant columns
+keep_cols <- c("appID", "date", "mean_playercount", "name", "Genre")
+game_data_curated <- player_data[, ..keep_cols]
+
+
+# ---- construct hierarchical identifiers ----
+
+# assign genre-based prefix
+genre_prefix_map <- data.table(
+  Genre = unique(game_data_curated$Genre),
+  Prefix = LETTERS[1:length(unique(game_data_curated$Genre))]
+)
+game_data_curated <- merge(game_data_curated, genre_prefix_map, by = "Genre", all.x = TRUE)
+
+# assign a numeric id per game within its genre
+game_data_curated[, game_num := .GRP, by = .(Genre, name)]
+
+# construct final colID (e.g., A01, B02)
+game_data_curated[, colID := sprintf("%s%02d", Prefix, game_num)]
+
+
+# ---- create time-based dummy variables ----
+
+# flag weekends
+game_data_curated[, is_weekend := as.integer(weekdays(date) %in% c("Saturday", "Sunday"))]
+
+# flag covid lockdown period (march 15 to may 15, 2020)
+lockdown_start <- as.Date("2020-03-15")
+lockdown_end <- as.Date("2020-05-15")
+game_data_curated[, is_lockdown := as.integer(date >= lockdown_start & date <= lockdown_end)]
+
+```
+
+---
+
+<hr style="height:2px; background-color:black; border:none;" />
+
+---
+
+```{r create_level_variables, message=FALSE, eval=TRUE}
+
+# break out individual game series, genres, and top level for testing and modeling
+
+# ---- individual game-level series ----
+indie_stardew    <- game_data_curated[name == "Stardew Valley"]
+indie_rimworld   <- game_data_curated[name == "RimWorld"]
+rpg_skyrim       <- game_data_curated[name == "The Elder Scrolls V: Skyrim Special Edition"]
+rpg_eternity     <- game_data_curated[name == "Pillars of Eternity"]
+mmo_ffxiv        <- game_data_curated[name == "FINAL FANTASY XIV Online"]
+mmo_eso          <- game_data_curated[name == "The Elder Scrolls Online: Tamriel Unlimited"]
+
+# ---- genre-level aggregate series ----
+indie <- rbind(indie_stardew, indie_rimworld)[,
+  .(
+    mean_playercount = sum(mean_playercount, na.rm = TRUE),
+    is_weekend = first(is_weekend),
+    is_lockdown = first(is_lockdown)
+  ),
+  by = date
+]
+
+rpg <- rbind(rpg_skyrim, rpg_eternity)[,
+  .(
+    mean_playercount = sum(mean_playercount, na.rm = TRUE),
+    is_weekend = first(is_weekend),
+    is_lockdown = first(is_lockdown)
+  ),
+  by = date
+]
+
+mmo <- rbind(mmo_ffxiv, mmo_eso)[,
+  .(
+    mean_playercount = sum(mean_playercount, na.rm = TRUE),
+    is_weekend = first(is_weekend),
+    is_lockdown = first(is_lockdown)
+  ),
+  by = date
+]
+
+# ---- total (Level 0) series ----
+total_series <- game_data_curated[,
+  .(
+    mean_playercount = sum(mean_playercount, na.rm = TRUE),
+    is_weekend = first(is_weekend),
+    is_lockdown = first(is_lockdown)
+  ),
+  by = date
+]
+
+```
+
+
+# 1) Define The Problem:
+#### This project focuses on forecasting short-term player engagement on Steam using a curated sample of popular games. Accurate daily player count forecasts can help inform real-world decisions like server load management, maintenance windows, and when to time promotions or releases. The goal is to model patterns in player activity that repeat weekly or shift during unique periods, like the early COVID-19 lockdown.
+
+#### Two approaches are used to forecast the top-level (aggregated) series: a manual SARIMA model that includes time-based dummy variables (weekends and lockdown), and a hierarchical time series (HTS) method that takes advantage of the genre and game-level structure underneath the total.
+
+---
+
+# 2) Gathering Information
+#### The data for this project comes from a publicly available Steam dataset on Mendeley Data, which includes detailed player count and price history for around 2,000 games between late 2017 and mid-2020. For this project, I narrowed it down to six games across three genres (Indie, RPG, MMO). Daily player counts were created from 5-minute and hourly logs that were combined and averaged to produce daily time series for each title. Data on game names, genres, and app IDs was merged in and two dummy variables to capture relevant patterns in the data were created: one for weekends and one for the early COVID-19 lockdown period (March 15 – May 15, 2020). The final dataset covers a 15-month span from May 2019 to August 2020 and was structured specifically to support both traditional and hierarchical forecasting methods.
+
+---
+
+# 3) Explore and Visualize Series
+#### To better understand the structure of the data, I began by plotting the overall trend in daily player counts across all games, with clear delineation between the training and test periods. This was followed by separate visualizations at the genre and individual game levels to highlight recurring patterns such as weekly seasonality and shifts in engagement. Basic summary statistics were also calculated for the top-level series to provide a snapshot of its scale and variability. Notably, player counts appear to rise during the early COVID-19 lockdown period, suggesting a temporary change in user behavior.
+
+```{r test_train_split, message=FALSE, eval=TRUE, fig.width=12}
+
+# ---- descriptive stats for total series ----
+
+# calculate descriptive stats
+total_summary <- total_series[, .(
+  Mean = mean(mean_playercount),
+  SD   = sd(mean_playercount),
+  Min  = min(mean_playercount),
+  Max  = max(mean_playercount)
+)]
+
+# transpose for vertical layout
+total_summary_t <- data.table(
+  Statistic = names(total_summary),
+  Value = as.numeric(total_summary[1])
+)
+
+# display the table
+kable(total_summary_t, digits = 2, caption = "Summary Statistics for Total Daily Player Count")
+
+
+# ---- split into training and test ----
+train_total <- total_series[date < as.Date("2020-05-12")]
+test_total  <- total_series[date >= as.Date("2020-05-12")]
+
+# extract y values
+y_train <- ts(train_total$mean_playercount, start = c(2019, 132), frequency = 365)
+y_test  <- test_total$mean_playercount
+
+# extract dummy variable matrix
+x_train <- as.matrix(train_total[, .(is_weekend, is_lockdown)])
+x_test  <- as.matrix(test_total[, .(is_weekend, is_lockdown)])
+
+
+# ---- combine train and test for plotting ----
+combined_data <- rbind(
+  train_total[, .(date, mean_playercount, set = "Train")],
+  test_total[, .(date, mean_playercount, set = "Test")]
+)
+
+# plot the combined series
+ggplot(combined_data, aes(x = date, y = mean_playercount, color = set)) +
+  geom_line(linewidth = 0.7) +
+  labs(
+    title = "Train and Test Series – Total Player Count",
+    x = "Date",
+    y = "Player Count",
+    color = "Data Set"
+  ) +
+  theme_minimal()
+
+# combine genre-level data into one dataset
+genre_data <- rbindlist(list(
+  indie[, .(date, mean_playercount, genre = "Indie")],
+  rpg[, .(date, mean_playercount, genre = "RPG")],
+  mmo[, .(date, mean_playercount, genre = "MMO")]
+))
+
+# create the 1x3 facet plot
+ggplot(genre_data, aes(x = date, y = mean_playercount)) +
+  geom_line(color = "black", linewidth = .5) +
+  facet_wrap(~ genre, nrow = 1, scales = "free_y") +
+  labs(
+    title = "Daily Mean Player Count by Genre",
+    x = "Date",
+    y = "Mean Player Count"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 11),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+# combine individual game data into one dataset with a unified name column
+game_data <- rbindlist(list(
+  indie_stardew[, .(date, mean_playercount, name = "Stardew Valley")],
+  indie_rimworld[, .(date, mean_playercount, name = "RimWorld")],
+  rpg_skyrim[, .(date, mean_playercount, name = "Skyrim Special Edition")],
+  rpg_eternity[, .(date, mean_playercount, name = "Pillars of Eternity")],
+  mmo_ffxiv[, .(date, mean_playercount, name = "Final Fantasy XIV")],
+  mmo_eso[, .(date, mean_playercount, name = "Elder Scrolls Online")]
+))
+
+# create the 2x3 grid of plots
+ggplot(game_data, aes(x = date, y = mean_playercount)) +
+  geom_line(color = "black", linewidth = .5) +
+  facet_wrap(~ name, ncol = 3, scales = "free_y") +
+  labs(
+    title = "Daily Mean Player Count by Game",
+    x = "Date",
+    y = "Mean Player Count"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 10),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+
+---
+
+<hr style="height:3px; background-color:black; border:none;" />
+
+---
+
+# 4) Choosing and Fitting Models
+
+## Benchmark Methods 
+
+#### Among benchmark models, the Naïve forecast produced the lowest RMSE, MAE, and MAPE values. Therefore, it is used as the baseline for comparison against more complex models.
+
+```{r 4a_benchmarks, message=FALSE}
+
+# benchmark forecasts on y_train
+naive_fc    <- naive(y_train, h = length(y_test))
+snaive_fc   <- snaive(y_train, h = length(y_test))
+mean_fc     <- meanf(y_train, h = length(y_test))
+drift_fc    <- rwf(y_train, drift = TRUE, h = length(y_test))
+
+# calculate accuracy metrics for each
+acc_naive  <- accuracy(naive_fc, y_test)
+acc_snaive <- accuracy(snaive_fc, y_test)
+acc_mean   <- accuracy(mean_fc, y_test)
+acc_drift  <- accuracy(drift_fc, y_test)
+
+# assemble summary table
+benchmark_table <- data.frame(
+  Method = c("Naive", "Seasonal Naive", "Mean", "Drift"),
+  RMSE   = c(acc_naive["Test set", "RMSE"],
+             acc_snaive["Test set", "RMSE"],
+             acc_mean["Test set", "RMSE"],
+             acc_drift["Test set", "RMSE"]),
+  MAE    = c(acc_naive["Test set", "MAE"],
+             acc_snaive["Test set", "MAE"],
+             acc_mean["Test set", "MAE"],
+             acc_drift["Test set", "MAE"]),
+  MAPE   = c(acc_naive["Test set", "MAPE"],
+             acc_snaive["Test set", "MAPE"],
+             acc_mean["Test set", "MAPE"],
+             acc_drift["Test set", "MAPE"])
+)
+
+# display results
+kable(benchmark_table, digits = 3, caption = "Benchmark Forecast Accuracy (Top-Level Series)")
+
+```
+
+
+---
+
+## ETS Models
+
+#### Among the ETS models evaluated, ETS(M,N,N) showed the lowest RMSE and MAPE values and was selected by the auto-ETS procedure. This model assumes a multiplicative error and no trend or seasonal component. Other ETS variants with trend components (A,A,N), (M,A,N), and (M,M,N) performed significantly worse, suggesting that trend modeling introduced instability into the forecasts.ETS(M,N,N) marginally outperformed the naïve benchmark, indicating that exponential smoothing may provide a slight measurable improvement in forecast accuracy.
+
+```{r ets_model_choice, message=FALSE, eval=FALSE, warning=FALSE, fig.height=15, fig.width=15}
+
+# ---- define ETS component grid ----
+ets_grid <- expand.grid(
+  Error = c("A", "M"),
+  Trend = c("N", "A", "M"),
+  Season = c("N", "A", "M"),
+  stringsAsFactors = FALSE
+)
+
+results_ets <- list()
+
+
+# ---- iterate over valid ETS combinations ----
+for (i in 1:nrow(ets_grid)) {
+  g <- ets_grid[i, ]
+  model_desc <- paste0("ETS(", g$Error, ",", g$Trend, ",", g$Season, ")")
+  
+  # skip invalid combinations
+  if ((g$Error == "M" && g$Trend == "M" && g$Season == "M") ||
+      (g$Error == "M" && g$Season == "M" && min(y_train) <= 0)) {
+    next
+  }
+  
+  tryCatch({
+    model <- ets(y_train, model = paste0(g$Error, g$Trend, g$Season))
+    fcast <- forecast(model, h = length(y_test))
+    acc <- accuracy(fcast$mean, y_test)
+
+    results_ets[[length(results_ets) + 1]] <- data.frame(
+      Model = model_desc,
+      Parameters = model$method,
+      AICc = round(model$aicc, 2),
+      RMSE = acc["Test set", "RMSE"],
+      MAE  = acc["Test set", "MAE"],
+      MAPE = acc["Test set", "MAPE"]
+    )
+  }, error = function(e) {
+    # skip models that error out
+  })
+}
+
+
+# ---- run auto ETS separately ----
+model_auto <- ets(y_train)
+fcast_auto <- forecast(model_auto, h = length(y_test))
+acc_auto <- accuracy(fcast_auto$mean, y_test)
+
+results_ets[[length(results_ets) + 1]] <- data.frame(
+  Model = "ETS(auto)",
+  Parameters = model_auto$method,
+  AICc = round(model_auto$aicc, 2),
+  RMSE = acc_auto["Test set", "RMSE"],
+  MAE  = acc_auto["Test set", "MAE"],
+  MAPE = acc_auto["Test set", "MAPE"]
+)
+
+# ---- compile and display results ----
+accuracy_table_ets <- do.call(rbind, results_ets)
+accuracy_table_ets <- accuracy_table_ets[order(accuracy_table_ets$RMSE), ]
+
+# ---- keep only top 4 models ----
+top_ets <- head(accuracy_table_ets, 4)
+rownames(top_ets) <- NULL
+
+# ---- display as table ----
+kable(top_ets, digits = 3, caption = "Top 4 ETS Models by RMSE (Including Auto)")
+
+```
+
+
+
+### ETS Forecast Plot – ETS(A,N,N)
+
+```{r ets_ann_plot, message=FALSE, eval=TRUE, fig.width=12}
+
+model_ets_ann <- ets(y_train, model = "ANN")
+fcast_ets_ann <- forecast(model_ets_ann, h = length(y_test))
+
+forecast_df_ann <- data.frame(
+  date = test_total$date,
+  value = as.numeric(fcast_ets_ann$mean),
+  lower_80 = as.numeric(fcast_ets_ann$lower[, 1]),
+  upper_80 = as.numeric(fcast_ets_ann$upper[, 1]),
+  lower_95 = as.numeric(fcast_ets_ann$lower[, 2]),
+  upper_95 = as.numeric(fcast_ets_ann$upper[, 2]),
+  set = "Forecast"
+)
+
+train_df_ann <- data.frame(
+  date = train_total$date,
+  value = as.numeric(fitted(model_ets_ann)),
+  set = "Train"
+)
+
+test_df_ann <- data.frame(
+  date = test_total$date,
+  value = as.numeric(y_test),
+  set = "Test"
+)
+
+plot_df_ann <- rbind(train_df_ann, test_df_ann, forecast_df_ann[, c("date", "value", "set")])
+
+
+# ---- plot ----
+ggplot(plot_df_ann, aes(x = date, y = value)) +
+  geom_line(aes(color = set), linewidth = 0.7) +
+  geom_ribbon(data = forecast_df_ann,
+              aes(x = date, ymin = lower_95, ymax = upper_95),
+              fill = "blue", alpha = 0.2) +
+  geom_ribbon(data = forecast_df_ann,
+              aes(x = date, ymin = lower_80, ymax = upper_80),
+              fill = "blue", alpha = 0.4) +
+  scale_color_manual(values = c("Train" = "green", "Test" = "blue", "Forecast" = "red")) +
+  ggtitle("ETS(A,N,N) Forecast vs Actual – Total Series") +
+  xlab("Date") + ylab("Player Count") +
+  theme_minimal()
+
+```
+
+### ETS Forecast Plot – ETS(M,N,N)
+
+```{r ets_mnn_plot, message=FALSE, eval=TRUE, fig.width=12}
+
+model_ets_mnn <- ets(y_train, model = "MNN")
+fcast_ets_mnn <- forecast(model_ets_mnn, h = length(y_test))
+
+forecast_df_mnn <- data.frame(
+  date = test_total$date,
+  value = as.numeric(fcast_ets_mnn$mean),
+  lower_80 = as.numeric(fcast_ets_mnn$lower[, 1]),
+  upper_80 = as.numeric(fcast_ets_mnn$upper[, 1]),
+  lower_95 = as.numeric(fcast_ets_mnn$lower[, 2]),
+  upper_95 = as.numeric(fcast_ets_mnn$upper[, 2]),
+  set = "Forecast"
+)
+
+train_df_mnn <- data.frame(
+  date = train_total$date,
+  value = as.numeric(fitted(model_ets_mnn)),
+  set = "Train"
+)
+
+test_df_mnn <- data.frame(
+  date = test_total$date,
+  value = as.numeric(y_test),
+  set = "Test"
+)
+
+plot_df_mnn <- rbind(train_df_mnn, test_df_mnn, forecast_df_mnn[, c("date", "value", "set")])
+
+
+# ---- plot ----
+ggplot(plot_df_mnn, aes(x = date, y = value)) +
+  geom_line(aes(color = set), linewidth = 0.7) +
+  geom_ribbon(data = forecast_df_mnn,
+              aes(x = date, ymin = lower_95, ymax = upper_95),
+              fill = "blue", alpha = 0.2) +
+  geom_ribbon(data = forecast_df_mnn,
+              aes(x = date, ymin = lower_80, ymax = upper_80),
+              fill = "blue", alpha = 0.4) +
+  scale_color_manual(values = c("Train" = "green", "Test" = "blue", "Forecast" = "red")) +
+  ggtitle("ETS(M,N,N) Forecast vs Actual – Total Series") +
+  xlab("Date") + ylab("Player Count") +
+  theme_minimal()
+
+```
+
+### ETS Forecast Plot – ETS(A,A,N)
+
+```{r ets_aan_plot, message=FALSE, eval=TRUE, fig.width=12}
+
+model_ets_aan <- ets(y_train, model = "AAN")
+fcast_ets_aan <- forecast(model_ets_aan, h = length(y_test))
+
+forecast_df_aan <- data.frame(
+  date = test_total$date,
+  value = as.numeric(fcast_ets_aan$mean),
+  lower_80 = as.numeric(fcast_ets_aan$lower[, 1]),
+  upper_80 = as.numeric(fcast_ets_aan$upper[, 1]),
+  lower_95 = as.numeric(fcast_ets_aan$lower[, 2]),
+  upper_95 = as.numeric(fcast_ets_aan$upper[, 2]),
+  set = "Forecast"
+)
+
+train_df_aan <- data.frame(
+  date = train_total$date,
+  value = as.numeric(fitted(model_ets_aan)),
+  set = "Train"
+)
+
+test_df_aan <- data.frame(
+  date = test_total$date,
+  value = as.numeric(y_test),
+  set = "Test"
+)
+
+plot_df_aan <- rbind(train_df_aan, test_df_aan, forecast_df_aan[, c("date", "value", "set")])
+
+
+# ---- plot ----
+ggplot(plot_df_aan, aes(x = date, y = value)) +
+  geom_line(aes(color = set), linewidth = 0.7) +
+  geom_ribbon(data = forecast_df_aan,
+              aes(x = date, ymin = lower_95, ymax = upper_95),
+              fill = "blue", alpha = 0.2) +
+  geom_ribbon(data = forecast_df_aan,
+              aes(x = date, ymin = lower_80, ymax = upper_80),
+              fill = "blue", alpha = 0.4) +
+  scale_color_manual(values = c("Train" = "green", "Test" = "blue", "Forecast" = "red")) +
+  ggtitle("ETS(A,A,N) Forecast vs Actual – Total Series") +
+  xlab("Date") + ylab("Player Count") +
+  theme_minimal()
+
+```
+
+### ETS Model Accuracy Comparison
+
+```{r ets_comparison_summary, message=FALSE, eval=TRUE}
+
+# ---- compute accuracy ----
+acc_ets_ann <- accuracy(fcast_ets_ann$mean, y_test)
+acc_ets_mnn <- accuracy(fcast_ets_mnn$mean, y_test)
+acc_ets_aan <- accuracy(fcast_ets_aan$mean, y_test)
+
+ets_summary <- data.frame(
+  Model = c("ETS(A,N,N)", "ETS(M,N,N)", "ETS(A,A,N)"),
+  RMSE = c(
+    acc_ets_ann["Test set", "RMSE"],
+    acc_ets_mnn["Test set", "RMSE"],
+    acc_ets_aan["Test set", "RMSE"]
+  ),
+  MAE = c(
+    acc_ets_ann["Test set", "MAE"],
+    acc_ets_mnn["Test set", "MAE"],
+    acc_ets_aan["Test set", "MAE"]
+  ),
+  MAPE = c(
+    acc_ets_ann["Test set", "MAPE"],
+    acc_ets_mnn["Test set", "MAPE"],
+    acc_ets_aan["Test set", "MAPE"]
+  ),
+  AICc = c(
+    model_ets_ann$aicc,
+    model_ets_mnn$aicc,
+    model_ets_aan$aicc
+  )
+)
+
+kable(ets_summary, digits = 3, caption = "ETS Model Accuracy Comparison – Top-Level Series")
+
+```
+
+
+### ETS Estimation Equations
+
+#### ETS(A,N,N) — Additive Error, No Trend, No Seasonality
+
+$$
+\begin{aligned}
+y_t &= \ell_{t-1} + \varepsilon_t \quad &\text{(Observation)} \\\\
+\ell_t &= \ell_{t-1} + \alpha \varepsilon_t \quad &\text{(Level)} \\\\
+\hat{y}_{t+h|t} &= \ell_t \quad &\text{(Forecast)}
+\end{aligned}
+$$
+
+---
+
+#### ETS(M,N,N)/(auto) — Multiplicative Error, No Trend, No Seasonality
+
+$$
+\begin{aligned}
+y_t &= \ell_{t-1}(1 + \varepsilon_t) \quad &\text{(Observation)} \\\\
+\ell_t &= \ell_{t-1}(1 + \alpha \varepsilon_t) \quad &\text{(Level)} \\\\
+\hat{y}_{t+h|t} &= \ell_t \quad &\text{(Forecast)}
+\end{aligned}
+$$
+
+---
+
+#### ETS(A,A,N) — Additive Error, Additive Trend, No Seasonality
+
+$$
+\begin{aligned}
+y_t &= \ell_{t-1} + b_{t-1} + \varepsilon_t \quad &\text{(Observation)} \\\\
+\ell_t &= \ell_{t-1} + b_{t-1} + \alpha \varepsilon_t \quad &\text{(Level)} \\\\
+b_t &= b_{t-1} + \beta \varepsilon_t \quad &\text{(Trend)} \\\\
+\hat{y}_{t+h|t} &= \ell_t + h b_t \quad &\text{(Forecast)}
+\end{aligned}
+$$
+
+
+---
+
+<hr style="height:2px; background-color:black; border:none;" />
+
+---
+
+# ARIMA Models
+
+### Auto Arima Benchmark
+
+```{r arima_model_choice, message=FALSE, eval=FALSE, warning=FALSE, fig.height=15, fig.width=15}
+
+# ---- define parameter grid ----
+model_grid <- expand.grid(
+  p = c(0, 1, 2, 3),
+  d = c(0, 1),
+  q = c(0, 1, 2, 3),
+  P = c(0, 1, 2, 3),
+  D = c(0),
+  Q = c(0, 1, 2, 3)
+)
+
+results <- list()
+
+
+# ---- iterate over grid ----
+for (i in 1:nrow(model_grid)) {
+  g <- model_grid[i, ]
+  cat("Fitting SARIMA(", g$p, ",", g$d, ",", g$q, ")(",
+      g$P, ",", g$D, ",", g$Q, ")[7]...\n")
+  
+  tryCatch({
+    model <- Arima(
+      y_train,
+      order = c(g$p, g$d, g$q),
+      seasonal = list(order = c(g$P, g$D, g$Q), period = 7),
+      xreg = x_train
+    )
+    
+    fcast <- forecast(model, h = length(y_test), xreg = x_test)
+    acc <- accuracy(fcast$mean, y_test)
+    
+    # Ljung-Box test (with degrees of freedom equal to # of parameters)
+    lb <- Box.test(residuals(model), lag = 14, type = "Ljung-Box", fitdf = length(coef(model)))
+    
+    results[[i]] <- data.frame(
+      p = g$p,
+      d = g$d,
+      q = g$q,
+      P = g$P,
+      D = g$D,
+      Q = g$Q,
+      RMSE = acc["Test set", "RMSE"],
+      MAE = acc["Test set", "MAE"],
+      MAPE = acc["Test set", "MAPE"],
+      Ljung_Box_p = round(lb$p.value, 4)
+    )
+  }, error = function(e) {
+    message("Error for (", g$p, ",", g$d, ",", g$q, ")(",
+            g$P, ",", g$D, ",", g$Q, "): ", e$message)
+  })
+}
+
+
+# ---- compile results ----
+accuracy_table <- do.call(rbind, results)
+accuracy_table <- accuracy_table[!is.na(accuracy_table$RMSE), ]
+accuracy_table <- accuracy_table[order(accuracy_table$RMSE), ]
+
+
+# ---- keep only top 10 models ----
+top_arima <- head(accuracy_table, 10)
+
+
+# ---- display table ----
+kable(top_arima, digits = 3, caption = "Top 10 SARIMA Models by RMSE (with xreg)")
+
+
+# ---- compile and display results sorted by Ljung-Box p-value ----
+accuracy_table_lb <- do.call(rbind, results)
+accuracy_table_lb <- accuracy_table_lb[!is.na(accuracy_table_lb$Ljung_Box_p), ]
+accuracy_table_lb <- accuracy_table_lb[order(-accuracy_table_lb$Ljung_Box_p), ]  # sort descending
+
+# ---- top 10 models by p-value ----
+top_lb <- head(accuracy_table_lb, 10)
+
+# ---- display table ----
+kable(top_lb, digits = 3, caption = "Top 10 SARIMA Models by Ljung-Box p-value (lowest residual autocorrelation)")
+
+```
+
+
+
+```{r auto_arima_baseline, message=FALSE, eval=TRUE, warning=FALSE, fig.width=12}
+
+# ---- fit auto.arima with regressors ----
+model_auto_arima <- auto.arima(
+  y_train,
+  xreg = x_train,
+  seasonal = TRUE,
+  stepwise = FALSE,
+  approximation = FALSE,
+  lambda = NULL
+)
+
+
+# ---- forecast using test xreg ----
+fcast_auto_arima <- forecast(model_auto_arima, xreg = x_test, h = length(y_test))
+
+
+# ---- convert train and test to consistent format ----
+train_df_auto <- data.frame(
+  date = train_total$date,
+  value = as.numeric(fitted(model_auto_arima)),
+  set = "Train"
+)
+
+test_df_auto <- data.frame(
+  date = test_total$date,
+  value = as.numeric(y_test),
+  set = "Test"
+)
+
+forecast_df_auto <- data.frame(
+  date = test_total$date,
+  value = as.numeric(fcast_auto_arima$mean),
+  lower_80 = as.numeric(fcast_auto_arima$lower[, 1]),
+  upper_80 = as.numeric(fcast_auto_arima$upper[, 1]),
+  lower_95 = as.numeric(fcast_auto_arima$lower[, 2]),
+  upper_95 = as.numeric(fcast_auto_arima$upper[, 2]),
+  set = "Forecast"
+)
+
+plot_df_auto <- rbind(
+  train_df_auto,
+  test_df_auto,
+  forecast_df_auto[, c("date", "value", "set")]
+)
+
+
+# ---- plot ----
+ggplot(plot_df_auto, aes(x = date, y = value)) +
+  geom_line(aes(color = set), linewidth = 0.7) +
+  geom_ribbon(data = forecast_df_auto,
+              aes(x = date, ymin = lower_95, ymax = upper_95),
+              fill = "blue", alpha = 0.2) +
+  geom_ribbon(data = forecast_df_auto,
+              aes(x = date, ymin = lower_80, ymax = upper_80),
+              fill = "blue", alpha = 0.4) +
+  scale_color_manual(values = c("Train" = "green", "Test" = "blue", "Forecast" = "red")) +
+  ggtitle("Auto ARIMA Forecast vs Actual – Total Series (with Dummies)") +
+  xlab("Date") + ylab("Player Count") +
+  theme_minimal()
+
+
+# ---- calculate accuracy ----
+acc_auto_arima <- accuracy(fcast_auto_arima$mean, y_test)
+```
+
+
+### Manual ARIMA Selection
+
+#### To identify suitable ARIMA models, I conducted a comprehensive grid search across SARIMA(p,d,q)(P,D,Q)[7] configurations using external regressors for weekends and the COVID lockdown period. For each model, I recorded forecast accuracy (RMSE, MAPE, AICc) as well as residual autocorrelation using the Ljung-Box test at lag 14. Models were ranked by both RMSE and p-value to assess the tradeoff between predictive accuracy and model diagnostics. Model 218 (SARIMA(3,1,3)(2,0,1)[7]) offered the lowest RMSE overall. Model 221 (SARIMA(2,0,0)(3,0,1)[7]) was not the top in terms of residual diagnostics but stood out in the top p-value set due to its significantly better forecast accuracy (lowest RMSE, MAE, and MAPE in that group). These two models were selected for their complementary strengths, model 218 for accuracy and model 221 for balancing strong accuracy with low residual autocorrelation.
+
+### Manual SARIMA (Minimized RMSE)
+
+```{r manual_arima_218, message=FALSE, eval=TRUE, warning=FALSE, fig.width=12}
+
+model_arima_218 <- Arima(
+  y_train,
+  order = c(3, 1, 3),
+  seasonal = list(order = c(2, 0, 1), period = 7),
+  xreg = x_train
+)
+
+fcast_arima_218 <- forecast(model_arima_218, h = length(y_test), xreg = x_test)
+
+train_df_218 <- data.frame(
+  date = train_total$date,
+  value = as.numeric(fitted(model_arima_218)),
+  set = "Train"
+)
+
+test_df_218 <- data.frame(
+  date = test_total$date,
+  value = as.numeric(y_test),
+  set = "Test"
+)
+
+forecast_df_218 <- data.frame(
+  date = test_total$date,
+  value = as.numeric(fcast_arima_218$mean),
+  lower_80 = as.numeric(fcast_arima_218$lower[, 1]),
+  upper_80 = as.numeric(fcast_arima_218$upper[, 1]),
+  lower_95 = as.numeric(fcast_arima_218$lower[, 2]),
+  upper_95 = as.numeric(fcast_arima_218$upper[, 2]),
+  set = "Forecast"
+)
+
+plot_df_218 <- rbind(
+  train_df_218,
+  test_df_218,
+  forecast_df_218[, c("date", "value", "set")]
+)
+
+ggplot(plot_df_218, aes(x = date, y = value)) +
+  geom_line(aes(color = set), linewidth = 0.7) +
+  geom_ribbon(data = forecast_df_218,
+              aes(x = date, ymin = lower_95, ymax = upper_95),
+              fill = "blue", alpha = 0.2) +
+  geom_ribbon(data = forecast_df_218,
+              aes(x = date, ymin = lower_80, ymax = upper_80),
+              fill = "blue", alpha = 0.4) +
+  scale_color_manual(values = c("Train" = "green", "Test" = "blue", "Forecast" = "red")) +
+  ggtitle("Manual SARIMA Forecast – Model 218") +
+  xlab("Date") + ylab("Player Count") +
+  theme_minimal()
+
+acc_arima_218 <- accuracy(fcast_arima_218$mean, y_test)
+
+```
+
+
+### Manual SARIMA (Minimized Autocorrelation)
+
+```{r manual_arima_221, message=FALSE, eval=TRUE, warning=FALSE, fig.width=12}
+
+model_arima_221 <- Arima(
+  y_train,
+  order = c(2, 0, 0),
+  seasonal = list(order = c(3, 0, 1), period = 7),
+  xreg = x_train
+)
+
+fcast_arima_221 <- forecast(model_arima_221, h = length(y_test), xreg = x_test)
+
+train_df_221 <- data.frame(
+  date = train_total$date,
+  value = as.numeric(fitted(model_arima_221)),
+  set = "Train"
+)
+
+test_df_221 <- data.frame(
+  date = test_total$date,
+  value = as.numeric(y_test),
+  set = "Test"
+)
+
+forecast_df_221 <- data.frame(
+  date = test_total$date,
+  value = as.numeric(fcast_arima_221$mean),
+  lower_80 = as.numeric(fcast_arima_221$lower[, 1]),
+  upper_80 = as.numeric(fcast_arima_221$upper[, 1]),
+  lower_95 = as.numeric(fcast_arima_221$lower[, 2]),
+  upper_95 = as.numeric(fcast_arima_221$upper[, 2]),
+  set = "Forecast"
+)
+
+plot_df_221 <- rbind(
+  train_df_221,
+  test_df_221,
+  forecast_df_221[, c("date", "value", "set")]
+)
+
+ggplot(plot_df_221, aes(x = date, y = value)) +
+  geom_line(aes(color = set), linewidth = 0.7) +
+  geom_ribbon(data = forecast_df_221,
+              aes(x = date, ymin = lower_95, ymax = upper_95),
+              fill = "blue", alpha = 0.2) +
+  geom_ribbon(data = forecast_df_221,
+              aes(x = date, ymin = lower_80, ymax = upper_80),
+              fill = "blue", alpha = 0.4) +
+  scale_color_manual(values = c("Train" = "green", "Test" = "blue", "Forecast" = "red")) +
+  ggtitle("Manual SARIMA Forecast – Model 221") +
+  xlab("Date") + ylab("Player Count") +
+  theme_minimal()
+
+acc_arima_221 <- accuracy(fcast_arima_221$mean, y_test)
+
+```
+
+
+### ARIMA Model Accuracy Comparison
+
+```{r arima_comparison_summary, message=FALSE, eval=TRUE}
+
+arima_summary <- data.frame(
+  Model = c("Auto ARIMA", "SARIMA(3,1,3)(2,0,1)[7]", "SARIMA(2,0,0)(3,0,1)[7]"),
+  RMSE = c(acc_auto_arima["Test set", "RMSE"], acc_arima_218["Test set", "RMSE"], acc_arima_221["Test set", "RMSE"]),
+  MAPE = c(acc_auto_arima["Test set", "MAPE"], acc_arima_218["Test set", "MAPE"], acc_arima_221["Test set", "MAPE"]),
+  AICc = c(model_auto_arima$aicc, model_arima_218$aicc, model_arima_221$aicc),
+  Ljung_Box_p = c(
+    Box.test(residuals(model_auto_arima), lag = 14, type = "Ljung-Box", fitdf = length(coef(model_auto_arima)))$p.value,
+    Box.test(residuals(model_arima_218), lag = 14, type = "Ljung-Box", fitdf = length(coef(model_arima_218)))$p.value,
+    Box.test(residuals(model_arima_221), lag = 14, type = "Ljung-Box", fitdf = length(coef(model_arima_221)))$p.value
+  )
+)
+
+kable(arima_summary, digits = 3, caption = "ARIMA Model Accuracy Comparison – Top-Level Series")
+
+```
+
+---
+
+### ARIMA and SARIMA Model Equations
+
+#### Auto ARIMA – ARIMA(2,1,3)
+
+This model includes 2 non-seasonal AR terms, 1 non-seasonal difference, and 3 non-seasonal MA terms.
+
+$$
+(1 - \phi_1 B - \phi_2 B^2)(1 - B)y_t = (1 + \theta_1 B + \theta_2 B^2 + \theta_3 B^3)\varepsilon_t
+$$
+
+---
+
+#### Model 218 – ARIMA(3,1,3)(2,0,1)[7]
+
+This model includes 3 non-seasonal AR terms, 1 non-seasonal difference, 3 non-seasonal MA terms, 2 seasonal AR terms, and 1 seasonal MA term with period 7.
+
+$$
+\begin{aligned}
+& (1 - \phi_1 B - \phi_2 B^2 - \phi_3 B^3)(1 - B)(1 - \Phi_1 B^7 - \Phi_2 B^{14})y_t \\
+&= (1 + \theta_1 B + \theta_2 B^2 + \theta_3 B^3)(1 + \Theta_1 B^7)\varepsilon_t
+\end{aligned}
+$$
+
+---
+
+#### Model 221 – ARIMA(2,0,0)(3,0,1)[7]
+
+This model includes 2 non-seasonal AR terms, 3 seasonal AR terms, and 1 seasonal MA term, with no differencing.
+
+$$
+(1 - \phi_1 B - \phi_2 B^2)(1 - \Phi_1 B^7 - \Phi_2 B^{14} - \Phi_3 B^{21})y_t = (1 + \Theta_1 B^7)\varepsilon_t
+$$
+
+
+---
+
+<hr style="height:2px; background-color:black; border:none;" />
+
+---
+
+## HTS Models
+
+#### A hierarchical time series (HTS) structure was applied to capture forecasts at both the game-level and genre-level, including the overall total. Two reconciliation approaches were tested. The Bottom-Up method produced forecasts for each individual game and then aggregated them to higher levels, operating under the assumption that the most detailed data contains the most reliable signal. In contrast, the MinT (Minimum Trace) method combined base forecasts from all levels using a generalized least squares framework, minimizing the total forecast error variance while ensuring aggregate consistency.
+
+### Bottom Up Method
+
+```{r hts_bu_total, message=FALSE, fig.width=12, fig.height=14}
+
+# ensure date column is proper Date format
+game_data_curated[, date := as.Date(date)]
+
+# reshape wide format: each colID (i.e. game) is a separate column
+hts_df <- dcast(game_data_curated, date ~ colID, value.var = "mean_playercount")
+
+# align regressors to the same date order as hts_df
+xreg_df <- unique(game_data_curated[, .(date, is_weekend)])
+setkey(xreg_df, date)
+setkey(hts_df, date)
+xreg_df <- xreg_df[hts_df[, .(date)]]
+
+# training/test split
+train_dates <- hts_df[date < as.Date("2020-05-12"), date]
+test_dates  <- hts_df[date >= as.Date("2020-05-12"), date]
+test_horizon <- length(test_dates)
+
+# model matrices for xreg (is_weekend only, no intercept)
+xreg_train  <- model.matrix(~ 0 + is_weekend, data = xreg_df[date %in% train_dates])
+xreg_future <- model.matrix(~ 0 + is_weekend, data = xreg_df[date %in% test_dates])
+
+# convert training data to time series object
+train_matrix <- as.matrix(hts_df[date %in% train_dates, -1, with = FALSE])
+train_ts <- ts(train_matrix, start = c(2019, 132), frequency = 365)
+
+# define HTS object
+train_hts <- hts(train_ts, characters = c(1, 2))
+
+# generate bottom-up ARIMA forecasts
+game_bu_forecast <- forecast(
+  train_hts,
+  h = test_horizon,
+  method = "bu",
+  fmethod = "arima",
+  xreg = xreg_train,
+  newxreg = xreg_future
+)
+
+# extract and combine forecasts for levels 0 and 1
+hist_0 <- aggts(train_hts, levels = 0)
+hist_1 <- aggts(train_hts, levels = 1)
+fcast_0 <- aggts(game_bu_forecast, levels = 0)
+fcast_1 <- aggts(game_bu_forecast, levels = 1)
+hist_all <- cbind(Total = hist_0, hist_1)
+fcast_all <- cbind(Total = fcast_0, fcast_1)
+combined <- ts(rbind(hist_all, fcast_all), start = start(hist_0), frequency = frequency(hist_0))
+
+# tidy format
+combined_df <- as.data.frame(combined)
+combined_df$Date <- seq(as.Date("2019-05-12"), by = "day", length.out = nrow(combined_df))
+combined_long <- pivot_longer(combined_df, cols = -Date, names_to = "Series", values_to = "value")
+combined_long$Series <- gsub(".*\\.", "", combined_long$Series)
+
+# apply genre labels
+genre_labels <- c("A" = "MMO", "B" = "RPG", "C" = "Indie")
+combined_long$Series <- ifelse(
+  combined_long$Series %in% names(genre_labels),
+  genre_labels[combined_long$Series],
+  combined_long$Series
+)
+combined_long$Series <- factor(combined_long$Series, levels = c("Total", "MMO", "RPG", "Indie"))
+
+# forecast start line
+forecast_start <- combined_df$Date[nrow(hist_0) + 1]
+cols <- hue_pal()(length(unique(combined_long$Series)))
+
+# plot
+ggplot(combined_long, aes(x = Date, y = value, group = Series, colour = Series)) +
+  geom_line(linewidth = 0.7) +
+  facet_grid(Series ~ ., scales = "free_y") +
+  geom_vline(xintercept = forecast_start, linetype = "dashed", color = "blue", linewidth = 1) +
+  scale_colour_manual(values = cols) +
+  xlab("Date") + ylab("Daily Mean Player Count") +
+  ggtitle("Bottom-Up HTS Forecasts with Regressors: Total and Genre-Level") +
+  theme_grey(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    strip.text.y = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+```
+
+
+```{r hts_bu_lvl2, message=FALSE, fig.width=12, fig.height=5}
+
+# extract game-level series from bottom-up forecast
+hist_lvl2 <- aggts(train_hts, levels = 2)
+fcast_lvl2 <- aggts(game_bu_forecast, levels = 2)
+combined_lvl2 <- ts(rbind(hist_lvl2, fcast_lvl2),
+                    start = start(hist_lvl2),
+                    frequency = frequency(hist_lvl2))
+
+# reshape to tidy format
+combined_df2 <- as_tibble(combined_lvl2)
+combined_df2$Date <- seq(as.Date("2019-05-12"), by = "day", length.out = nrow(combined_df2))
+combined_long2 <- gather(combined_df2, key = "colID", value = "value", -Date)
+
+# merge game names
+title_lookup <- unique(game_data_curated[, .(colID, name)])
+combined_long2 <- merge(combined_long2, title_lookup, by = "colID", all.x = TRUE)
+
+# extract genre prefix and map
+combined_long2$Genre <- substr(combined_long2$colID, 1, 1)
+genre_labels <- c("A" = "MMO", "B" = "RPG", "C" = "Indie")
+combined_long2$Genre <- factor(genre_labels[combined_long2$Genre], levels = c("MMO", "RPG", "Indie"))
+
+# forecast start date
+forecast_start <- combined_df2$Date[nrow(hist_lvl2) + 1]
+
+# color palette
+games <- unique(combined_long2$name)
+zone_colors <- setNames(hcl.colors(length(games), "Dynamic"), games)
+
+# plot 2x3 grid
+ggplot(combined_long2, aes(x = Date, y = value, group = name, colour = name)) +
+  geom_line(linewidth = 0.7) +
+  facet_wrap(~ name, ncol = 2, scales = "free_y") +
+  geom_vline(xintercept = forecast_start, linetype = "dashed", color = "blue", linewidth = 1) +
+  scale_colour_manual(values = zone_colors) +
+  xlab("Date") + ylab("Daily Mean Player Count") +
+  ggtitle("Bottom-Up HTS Forecasts: Game-Level (Level 2)") +
+  theme_grey(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    legend.position = "none"
+  )
+
+```
+
+---
+
+### MinT Method
+
+```{r hts_forecast_total, message=FALSE, fig.width=12, fig.height=14}
+
+# ensure date column is proper Date format
+game_data_curated[, date := as.Date(date)]
+
+# reshape wide format: each colID (i.e. game) is a separate column
+hts_df <- dcast(game_data_curated, date ~ colID, value.var = "mean_playercount")
+
+# align regressors to the same date order as hts_df
+xreg_df <- unique(game_data_curated[, .(date, is_weekend)])
+setkey(xreg_df, date)
+setkey(hts_df, date)
+xreg_df <- xreg_df[hts_df[, .(date)]]  # ensure exact alignment
+
+# training/test split
+train_dates <- hts_df[date < as.Date("2020-05-12"), date]
+test_dates  <- hts_df[date >= as.Date("2020-05-12"), date]
+test_horizon <- length(test_dates)
+
+# model matrices for xreg (only using is_weekend)
+xreg_train  <- model.matrix(~ 0 + is_weekend, data = xreg_df[date %in% train_dates])
+xreg_future <- model.matrix(~ 0 + is_weekend, data = xreg_df[date %in% test_dates])
+
+# convert training data to time series object
+train_matrix <- as.matrix(hts_df[date %in% train_dates, -1, with = FALSE])
+train_ts <- ts(train_matrix, start = c(2019, 132), frequency = 365)
+
+# define HTS object
+train_hts <- hts(train_ts, characters = c(1, 2))
+
+# generate MinT reconciled ARIMA forecasts with regressors and relaxed model fitting
+game_mint_forecast <- forecast(
+  train_hts,
+  h = test_horizon,
+  method = "comb",
+  fmethod = "arima",
+  xreg = xreg_train,
+  newxreg = xreg_future,
+)
+
+# extract historical and forecasted series for levels 0 and 1
+hist_0 <- aggts(train_hts, levels = 0)
+hist_1 <- aggts(train_hts, levels = 1)
+fcast_0 <- aggts(game_mint_forecast, levels = 0)
+fcast_1 <- aggts(game_mint_forecast, levels = 1)
+
+# combine and reshape
+hist_all <- cbind(Total = hist_0, hist_1)
+fcast_all <- cbind(Total = fcast_0, fcast_1)
+combined <- ts(rbind(hist_all, fcast_all), start = start(hist_0), frequency = frequency(hist_0))
+
+combined_df <- as.data.frame(combined)
+combined_df$Date <- seq(as.Date("2019-05-12"), by = "day", length.out = nrow(combined_df))
+combined_long <- pivot_longer(combined_df, cols = -Date, names_to = "Series", values_to = "value")
+
+# clean up labels (e.g., "hist_1.A" -> "A")
+combined_long$Series <- gsub(".*\\.", "", combined_long$Series)
+
+# apply genre names
+genre_labels <- c("A" = "MMO", "B" = "RPG", "C" = "Indie")
+combined_long$Series <- ifelse(
+  combined_long$Series %in% names(genre_labels),
+  genre_labels[combined_long$Series],
+  combined_long$Series
+)
+
+# re-factor for plot order
+combined_long$Series <- factor(combined_long$Series, levels = c("Total", "MMO", "RPG", "Indie"))
+
+# mark forecast start
+forecast_start <- combined_df$Date[nrow(hist_0) + 1]
+cols <- hue_pal()(length(unique(combined_long$Series)))
+
+# plot
+ggplot(combined_long, aes(x = Date, y = value, group = Series, colour = Series)) +
+  geom_line(linewidth = 0.7) +
+  facet_grid(Series ~ ., scales = "free_y") +
+  geom_vline(xintercept = forecast_start, linetype = "dashed", color = "blue", linewidth = 1) +
+  scale_colour_manual(values = cols) +
+  xlab("Date") + ylab("Daily Mean Player Count") +
+  ggtitle("HTS Forecasts with Regressors: Total and Genre-Level Series") +
+  theme_grey(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    strip.text.y = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+```
+
+
+```{r hts_forecast_lvl2, message=FALSE, fig.width=12, fig.height=5}
+
+# extract level 2 observed and forecast data
+hist_lvl2 <- aggts(train_hts, levels = 2)
+fcast_lvl2 <- aggts(game_mint_forecast, levels = 2)
+
+# combine history and forecast
+combined_lvl2 <- ts(rbind(hist_lvl2, fcast_lvl2),
+                    start = start(hist_lvl2),
+                    frequency = frequency(hist_lvl2))
+
+# reshape to tidy format
+combined_df2 <- as_tibble(combined_lvl2)
+combined_df2$Date <- seq(as.Date("2019-05-12"), by = "day", length.out = nrow(combined_df2))
+combined_long2 <- gather(combined_df2, key = "colID", value = "value", -Date)
+
+# merge in full game names based on colID
+title_lookup <- unique(game_data_curated[, .(colID, name)])
+combined_long2 <- merge(combined_long2, title_lookup, by = "colID", all.x = TRUE)
+
+# extract genre prefix
+combined_long2$Genre <- substr(combined_long2$colID, 1, 1)
+genre_labels <- c("A" = "MMO", "B" = "RPG", "C" = "Indie")
+combined_long2$Genre <- factor(genre_labels[combined_long2$Genre], levels = c("MMO", "RPG", "Indie"))
+
+# forecast start date
+forecast_start <- combined_df2$Date[nrow(hist_lvl2) + 1]
+
+# generate color palette per game
+games <- unique(combined_long2$name)
+zone_colors <- setNames(hcl.colors(length(games), "Dynamic"), games)
+
+# plot using game titles
+ggplot(combined_long2, aes(x = Date, y = value, group = name, colour = name)) +
+  geom_line(linewidth = 0.7) +
+  facet_wrap(~ name, ncol = 2, scales = "free_y") +
+  geom_vline(xintercept = forecast_start, linetype = "dashed", color = "blue", linewidth = 1) +
+  scale_colour_manual(values = zone_colors) +
+  xlab("Date") + ylab("Daily Mean Player Count") +
+  ggtitle("HTS Forecasts: Game-Level (Level 2) Series") +
+  theme_grey(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    legend.position = "none"
+  )
+
+```
+
+---
+
+### Hierarchical Forecasting Equations
+
+#### Bottom-Up (BU) Forecasting
+
+The **bottom-up method** generates coherent forecasts by first forecasting only the bottom-level series and then aggregating these to obtain forecasts for all higher levels in the hierarchy.
+
+The bottom-up reconciled forecasts are given by:
+\[
+\tilde{\mathbf{y}}_{h} = \mathbf{S} \hat{\mathbf{b}}_{h}
+\]
+
+---
+
+#### MinT (Minimum Trace) Reconciliation
+
+The MinT method reconciles base forecasts from all series (at all levels) to ensure coherence. It minimizes the total forecast error variance across the hierarchy using a generalized least squares approach.
+
+The MinT reconciled forecasts are given by:
+\[
+\hat{\mathbf{y}}^*_{t+h} = \mathbf{S} (\mathbf{S}' \mathbf{W}_h^{-1} \mathbf{S})^{-1} \mathbf{S}' \mathbf{W}_h^{-1} \hat{\mathbf{y}}_{t+h}
+\]
+
+---
+
+<hr style="height:2px; background-color:black; border:none;" />
+
+---
+
+
+## NNAR Model
+
+#### After manually experimenting with different parameters, a NNAR model was fit using weekly lags (p = 7) and 10 hidden nodes (size = 10). Two binary regressors (weekend and COVID dummies) were included to capture calendar effects. These adjustments improved alignment with seasonal patterns and reduced overestimation.
+
+```{r nnar_model, message=FALSE, warning=FALSE, eval=TRUE, fig.width=12}
+
+# ---- fit NNAR model with dummy regressors ----
+model_nnar <- nnetar(y_train, xreg = x_train, p = 7, size = 10)
+
+# ---- forecast using test xreg ----
+fcast_nnar <- forecast(model_nnar, xreg = x_test, h = length(y_test))
+
+# ---- prepare train and test data ----
+train_df_nnar <- data.frame(
+  date = train_total$date,
+  value = as.numeric(fitted(model_nnar)),
+  set = "Train"
+)
+
+test_df_nnar <- data.frame(
+  date = test_total$date,
+  value = as.numeric(y_test),
+  set = "Test"
+)
+
+forecast_df_nnar <- data.frame(
+  date = test_total$date,
+  value = as.numeric(fcast_nnar$mean),
+  set = "Forecast"
+)
+
+plot_df_nnar <- rbind(
+  train_df_nnar,
+  test_df_nnar,
+  forecast_df_nnar
+)
+
+# ---- plot ----
+ggplot(plot_df_nnar, aes(x = date, y = value)) +
+  geom_line(aes(color = set), linewidth = 0.7) +
+  scale_color_manual(values = c("Train" = "green", "Test" = "blue", "Forecast" = "red")) +
+  ggtitle("NNAR Forecast vs Actual – Total Series (with Dummies)") +
+  xlab("Date") + ylab("Player Count") +
+  theme_minimal()
+
+# ---- accuracy metrics ----
+acc_nnar <- accuracy(fcast_nnar$mean, y_test)
+
+```
+
+---
+
+### Neural Network Autoregression (NNAR) Equations
+
+The NNAR model is a type of feed-forward neural network applied to lagged values of the time series. In this case, the model used 7 lagged observations as inputs and 10 hidden nodes, along with binary dummy regressors.
+
+Each hidden node takes a weighted combination of the inputs:
+
+\[
+z_j = b_j + \sum_{i=1}^{p+k} w_{i,j} x_i
+\]
+
+This is passed through a sigmoid activation function to produce the node output. The final forecast is then a weighted sum of all hidden node outputs.
+
+---
+
+
+## Forecast Comparison
+
+```{r compare_all_forecasts, message=FALSE, fig.width=12, fig.height=6}
+
+# ---- extract bottom-up and MinT forecasts + accuracy ----
+fcast_bu   <- aggts(game_bu_forecast, levels = 0)
+fcast_mint <- aggts(game_mint_forecast, levels = 0)
+acc_bu     <- accuracy(fcast_bu, y_test)
+acc_mint   <- accuracy(fcast_mint, y_test)
+
+
+# ---- compile final accuracy comparison table (no AICc) ----
+comparison_table <- data.frame(
+  Method = c(
+    "Naive Benchmark",
+    "ARIMA(2,3,0) (Auto)",
+    "ARIMA(3,1,3)(2,0,1)[7]",
+    "ARIMA(2,0,0)(3,0,1)[7]",
+    "ETS(A,N,N)",
+    "ETS(M,N,N)",
+    "ETS(A,A,N)",
+    "Bottom-Up",
+    "MinT",
+    "NNAR(p=7, size=10)"
+  ),
+  RMSE = c(
+    acc_naive["Test set", "RMSE"],
+    acc_auto_arima["Test set", "RMSE"],
+    acc_arima_218["Test set", "RMSE"],
+    acc_arima_221["Test set", "RMSE"],
+    acc_ets_ann["Test set", "RMSE"],
+    acc_ets_mnn["Test set", "RMSE"],
+    acc_ets_aan["Test set", "RMSE"],
+    acc_bu["Test set", "RMSE"],
+    acc_mint["Test set", "RMSE"],
+    acc_nnar["Test set", "RMSE"]
+  ),
+  MAE = c(
+    acc_naive["Test set", "MAE"],
+    acc_auto_arima["Test set", "MAE"],
+    acc_arima_218["Test set", "MAE"],
+    acc_arima_221["Test set", "MAE"],
+    acc_ets_ann["Test set", "MAE"],
+    acc_ets_mnn["Test set", "MAE"],
+    acc_ets_aan["Test set", "MAE"],
+    acc_bu["Test set", "MAE"],
+    acc_mint["Test set", "MAE"],
+    acc_nnar["Test set", "MAE"]
+  ),
+  MAPE = c(
+    acc_naive["Test set", "MAPE"],
+    acc_auto_arima["Test set", "MAPE"],
+    acc_arima_218["Test set", "MAPE"],
+    acc_arima_221["Test set", "MAPE"],
+    acc_ets_ann["Test set", "MAPE"],
+    acc_ets_mnn["Test set", "MAPE"],
+    acc_ets_aan["Test set", "MAPE"],
+    acc_bu["Test set", "MAPE"],
+    acc_mint["Test set", "MAPE"],
+    acc_nnar["Test set", "MAPE"]
+  )
+)
+
+
+# ---- display table ----
+kable(comparison_table, digits = 3, caption = "Forecast Accuracy – Top-Level Series (ARIMA, ETS, Reconciliation, and NNAR Methods)")
+
+```
+
+---
+
+<hr style="height:2px; background-color:black; border:none;" />
+
+---
+
+## Step 4b) SARIMA Model Tweaks
+
+### Forecast Accuracy Summary
+
+```{r arima_tweaks_accuracy, message=TRUE, warning=TRUE, eval=TRUE}
+
+# ---- create weekend and lockdown dummies for train and test ----
+weekend_train   <- as.numeric(weekdays(train_total$date) %in% c("Saturday", "Sunday"))
+lockdown_train  <- as.numeric(train_total$date >= as.Date("2020-03-15") & train_total$date <= as.Date("2020-05-01"))
+
+weekend_test    <- as.numeric(weekdays(test_total$date) %in% c("Saturday", "Sunday"))
+lockdown_test   <- as.numeric(test_total$date >= as.Date("2020-03-15") & test_total$date <= as.Date("2020-05-01"))
+
+arima_tweaks <- list(
+  list(name = "Baseline",                   order = c(3, 1, 3), seasonal = c(2, 0, 1), xreg = x_train),
+  list(name = "Simplified Variant",         order = c(2, 1, 2), seasonal = c(2, 0, 1), xreg = x_train),
+  list(name = "Reduce MA Order",            order = c(3, 1, 2), seasonal = c(2, 0, 1), xreg = x_train),
+  list(name = "Reduce AR Order",            order = c(2, 1, 3), seasonal = c(2, 0, 1), xreg = x_train),
+  list(name = "Reduce Seasonal AR",         order = c(3, 1, 3), seasonal = c(1, 0, 1), xreg = x_train),
+  list(name = "Reduce Seasonal MA",         order = c(3, 1, 3), seasonal = c(2, 0, 0), xreg = x_train),
+  list(name = "No Regressors",              order = c(3, 1, 3), seasonal = c(0, 0, 0), xreg = NULL, method = "ML"),
+  list(name = "Weekend Dummy Only",         order = c(3, 1, 3), seasonal = c(2, 0, 1), xreg = weekend_train),
+  list(name = "Lockdown Dummy Only",        order = c(3, 1, 3), seasonal = c(0, 0, 0), xreg = lockdown_train, method = "ML"),
+  list(name = "Double Seasonality (Period 14)", order = c(3, 1, 3), seasonal = c(2, 0, 1), period = 14, xreg = x_train)
+)
+
+# ---- prepare test xreg values ----
+xreg_test_list <- list(
+  x_test, x_test, x_test, x_test, x_test, x_test, NULL,
+  weekend_test, lockdown_test, x_test
+)
+
+# ---- initialize results list ----
+results_tweaks <- list()
+
+# ---- iterate through tweaks with logging ----
+for (i in seq_along(arima_tweaks)) {
+  tweak <- arima_tweaks[[i]]
+  period <- ifelse(is.null(tweak$period), 7, tweak$period)
+  xreg_train <- tweak$xreg
+  xreg_test  <- xreg_test_list[[i]]
+  
+  tryCatch({
+    model <- Arima(
+      y_train,
+      order = tweak$order,
+      seasonal = list(order = tweak$seasonal, period = period),
+      xreg = xreg_train
+    )
+
+    fcast <- forecast(model, h = length(y_test), xreg = xreg_test)
+    acc <- accuracy(fcast$mean, y_test)
+    lb_p <- Box.test(residuals(model), lag = 14, type = "Ljung-Box", fitdf = length(coef(model)))$p.value
+
+    desc <- paste0("ARIMA(", paste(tweak$order, collapse = ","), ")(",
+                   paste(tweak$seasonal, collapse = ","), ")[", period, "]")
+
+    results_tweaks[[i]] <- data.frame(
+      Model = tweak$name,
+      Description = desc,
+      RMSE  = acc["Test set", "RMSE"],
+      MAE   = acc["Test set", "MAE"],
+      MAPE  = acc["Test set", "MAPE"],
+      AICc  = model$aicc,
+      Ljung_Box_p = lb_p
+    )
+  }, error = function(e) {
+    message("Error in model '", tweak$name, "': ", e$message)
+    results_tweaks[[i]] <- data.frame(
+      Model = tweak$name,
+      Description = "Model failed to fit",
+      RMSE = NA, MAE = NA, MAPE = NA, AICc = NA, Ljung_Box_p = NA
+    )
+  })
+}
+
+# ---- compile and display results ----
+tweak_accuracy_table <- do.call(rbind, results_tweaks)
+kable(tweak_accuracy_table, digits = 3, caption = "Forecast Accuracy – ARIMA Model Tweaks (Including Baseline)")
+
+```
+
+---
+
+### Descriptions and Rationale
+
+**Baseline**: The original selected model, ARIMA(3,1,3)(2,0,1)[7], was identified through a comprehensive grid search for minimizing RMSE while maintaining low residual autocorrelation. It serves as the standard against which all refinements are evaluated.
+
+**Simplified Variant**: This model reduces overall complexity by lowering both AR and MA orders. It was tested to determine if similar performance could be achieved with fewer parameters, potentially improving generalizability.
+
+**Reduce MA Order**: The MA order was reduced from 3 to 2 while holding other terms constant. This tweak assessed whether the third MA term was contributing meaningfully to forecast accuracy.
+
+**Reduce AR Order**: The AR order was reduced from 3 to 2. Like the MA tweak, this tests if fewer AR terms can still capture the underlying autocorrelation effectively.
+
+**Reduce Seasonal AR**: The seasonal AR term was reduced from 2 to 1, evaluating whether the model was overfitting seasonal dynamics.
+
+**Reduce Seasonal MA**: The seasonal MA term was removed to explore its impact on residual autocorrelation and forecast precision.
+
+**No Regressors**: This version of the model omits all external regressors and simplifies the seasonal structure. It was included to assess how well an ARIMA model could perform based solely on internal time series dynamics, without the aid of dummy variables.
+
+**Weekend Dummy Only**: This model excludes the lockdown dummy and retains only the weekend regressor. It tests whether modeling weekly patterns alone offers sufficient explanatory power.
+
+**Lockdown Dummy Only**: This model includes only the lockdown dummy as an external variable. It isolates the influence of the lockdown period on model performance while simplifying the seasonal terms.
+
+**Double Seasonality (Period 14)**: The seasonal period was changed from 7 to 14 to explore whether incorporating biweekly effects might improve forecast performance.
+
+
+## **Final Model Selection:** SARIMA(2,1,3)(2,0,1)[7]
+
+#### After evaluating nine ARIMA model variations, ARIMA(2,1,3)(2,0,1)[7] was selected as the final forecasting model. While the baseline model ARIMA(3,1,3)(2,0,1)[7] achieved the lowest RMSE (4981.576), this alternate specification produced a nearly equivalent RMSE (5005.467) with two key advantages. It had a lower AICc value (6901.941 vs. 6904.127), suggesting a better trade-off between model fit and complexity, and a higher Ljung-Box p-value (0.114 vs. 0.062), indicating reduced residual autocorrelation. This version of the model uses one fewer autoregressive term, reducing complexity without a significant loss in forecast accuracy. Given these advantages, ARIMA(2,1,3)(2,0,1)[7] was selected for producing final forecasts and recommendation outputs.
+
+---
+
+```{r final_test_train_plot, message=FALSE, warning=FALSE, fig.width=12}
+
+# ---- refit final selected model on training data ----
+model_sarima_213 <- Arima(
+  y_train,
+  order = c(2, 1, 3),
+  seasonal = list(order = c(2, 0, 1), period = 7),
+  xreg = x_train
+)
+
+# ---- forecast over test period ----
+fcast_sarima_213 <- forecast(model_sarima_213, h = length(y_test), xreg = x_test)
+
+# ---- prepare dataframes for plotting ----
+train_df_213 <- data.frame(
+  date = train_total$date,
+  value = as.numeric(fitted(model_sarima_213)),
+  set = "Train"
+)
+
+test_df_213 <- data.frame(
+  date = test_total$date,
+  value = as.numeric(y_test),
+  set = "Test"
+)
+
+forecast_df_213 <- data.frame(
+  date = test_total$date,
+  value = as.numeric(fcast_sarima_213$mean),
+  lower_80 = as.numeric(fcast_sarima_213$lower[, 1]),
+  upper_80 = as.numeric(fcast_sarima_213$upper[, 1]),
+  lower_95 = as.numeric(fcast_sarima_213$lower[, 2]),
+  upper_95 = as.numeric(fcast_sarima_213$upper[, 2]),
+  set = "Forecast"
+)
+
+plot_df_213 <- rbind(
+  train_df_213,
+  test_df_213,
+  forecast_df_213[, c("date", "value", "set")]
+)
+
+# ---- plot with CI and data split labels ----
+ggplot(plot_df_213, aes(x = date, y = value)) +
+  geom_line(aes(color = set), linewidth = 0.7) +
+  geom_ribbon(data = forecast_df_213,
+              aes(x = date, ymin = lower_95, ymax = upper_95),
+              fill = "blue", alpha = 0.2) +
+  geom_ribbon(data = forecast_df_213,
+              aes(x = date, ymin = lower_80, ymax = upper_80),
+              fill = "blue", alpha = 0.4) +
+  scale_color_manual(values = c("Train" = "green", "Test" = "blue", "Forecast" = "red")) +
+  ggtitle("Forecast from Final Model SARIMA(2,1,3)(2,0,1)[7] vs. Test Set") +
+  xlab("Date") + ylab("Player Count") +
+  theme_minimal()
+
+checkresiduals(model_sarima_213)
+
+```
+
+---
+
+<hr style="height:2px; background-color:black; border:none;" />
+
+---
+
+# 5) Implement Forecasts
+
+```{r step5_final_forecast, message=FALSE, warning=FALSE, fig.width=12, fig.height=6}
+
+# ---- define response and regressors from full dataset ----
+y_full <- ts(total_series$mean_playercount, frequency = 7)
+xreg_full <- as.matrix(total_series[, .(is_weekend, is_lockdown)])
+
+# ---- refit model on full data ----
+model_final <- Arima(
+  y_full,
+  order = c(2, 1, 3),
+  seasonal = list(order = c(2, 0, 1), period = 7),
+  xreg = xreg_full
+)
+
+# ---- create 90-day future regressor matrix ----
+h <- 90
+future_dates <- seq(max(total_series$date) + 1, by = "day", length.out = h)
+
+xreg_future <- data.frame(
+  is_weekend = as.integer(weekdays(future_dates) %in% c("Saturday", "Sunday")),
+  is_lockdown = 0
+)
+
+# ---- generate forecast ----
+fcast_final <- forecast(model_final, h = h, xreg = as.matrix(xreg_future))
+
+# ---- build forecast dataframe ----
+forecast_df <- data.frame(
+  date = future_dates,
+  forecast = as.numeric(fcast_final$mean),
+  lower_80 = as.numeric(fcast_final$lower[, 1]),
+  upper_80 = as.numeric(fcast_final$upper[, 1]),
+  lower_95 = as.numeric(fcast_final$lower[, 2]),
+  upper_95 = as.numeric(fcast_final$upper[, 2])
+)
+
+# ---- combine historical fitted and forecasted data ----
+fitted_df <- data.frame(
+  date = total_series$date,
+  value = as.numeric(fitted(model_final)),
+  set = "Fitted"
+)
+
+forecast_plot_df <- rbind(
+  fitted_df,
+  data.frame(
+    date = forecast_df$date,
+    value = forecast_df$forecast,
+    set = "Forecast"
+  )
+)
+
+# ---- plot with prediction intervals ----
+ggplot(forecast_plot_df, aes(x = date, y = value, color = set)) +
+  geom_line(linewidth = 0.8) +
+  geom_ribbon(data = forecast_df,
+              aes(x = date, ymin = lower_95, ymax = upper_95),
+              inherit.aes = FALSE,
+              fill = "blue", alpha = 0.2) +
+  geom_ribbon(data = forecast_df,
+              aes(x = date, ymin = lower_80, ymax = upper_80),
+              inherit.aes = FALSE,
+              fill = "blue", alpha = 0.4) +
+  scale_color_manual(values = c("Fitted" = "green", "Forecast" = "red")) +
+  labs(
+    title = "Final Forecast – SARIMA(2,1,3)(2,0,1)[7]",
+    x = "Date",
+    y = "Player Count",
+    color = "Series"
+  ) +
+  theme_minimal()
+
+```
+
+
+### Step 5 Commentary
+
+#### The point forecasts from the final SARIMA model show a continued upward trend in player counts beyond the test period. While this trajectory aligns with elevated engagement during the COVID-19 lockdown period, it appears less reasonable when viewed in the context of the full series. Player counts were already beginning to decline by August 2020, suggesting the model may be overestimating future demand due to lingering effects of the temporary surge.
+
+#### The forecast includes wide 80% and 95% prediction intervals that expand significantly over the 90-day horizon. This level of uncertainty seems appropriate given the volatility of the data and the limited post-lockdown observations available. It reflects the model’s acknowledgment that future behavior could vary substantially—either continuing elevated engagement or reverting toward baseline levels.
+
+#### One plausible scenario that would invalidate the forecasts is a post-pandemic normalization in player behavior. If the spike in engagement was temporary, driven by lockdown conditions, the continued upward trajectory in the forecasts would be unrealistic. Additionally, the emergence of new games or platform changes could shift player engagement dynamics in a way not captured by the historical data.
+
+#### If future player counts fall well below forecasted values, the model could be improved by re-estimating on post-lockdown data only or incorporating a structural break. More granular covariates such as game releases and updates, holidays, or marketing events could also help improve predictive accuracy.
+
